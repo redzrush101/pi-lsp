@@ -2,6 +2,8 @@
 
 Language-agnostic code intelligence for [pi](https://github.com/badlogic/pi-mono) via Language Server Protocol. Purely config-driven — you define which servers to use per project.
 
+Originally by [dreki-gg](https://github.com/dreki-gg).
+
 
 ## Install
 
