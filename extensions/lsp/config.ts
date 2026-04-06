@@ -13,7 +13,7 @@
 
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { execSync } from 'node:child_process';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 
 import type { LspConfigFile, LspServerUserConfig, ResolvedServerConfig } from './types';
@@ -24,8 +24,8 @@ function globalConfigPath(): string {
   return join(process.env.HOME ?? homedir(), '.pi', 'agent', 'extensions', 'lsp', 'config.json');
 }
 
-function projectConfigPath(cwd: string): string {
-  return join(cwd, '.pi', 'lsp.json');
+function projectConfigPath(workspaceRoot: string): string {
+  return join(workspaceRoot, '.pi', 'lsp.json');
 }
 
 async function fileExists(path: string): Promise<boolean> {
@@ -47,13 +47,37 @@ const STARTER_CONFIG = `{
 }
 `;
 
+const WORKSPACE_MARKERS = ['.pi/lsp.json', 'package.json', 'tsconfig.json', 'jsconfig.json', '.git'];
+
+// ── Workspace discovery ─────────────────────────────────────────────────────
+
+async function hasWorkspaceMarker(dir: string): Promise<boolean> {
+  for (const marker of WORKSPACE_MARKERS) {
+    if (await fileExists(join(dir, marker))) return true;
+  }
+  return false;
+}
+
+export async function findWorkspaceRoot(startPath: string): Promise<string> {
+  let current = resolve(startPath);
+
+  while (true) {
+    if (await hasWorkspaceMarker(current)) return current;
+
+    const parent = dirname(current);
+    if (parent === current) return resolve(startPath);
+    current = parent;
+  }
+}
+
 /**
  * Scaffold a starter global config if neither global nor project config exists.
  * Returns true if a file was created.
  */
 export async function scaffoldGlobalConfig(cwd: string): Promise<boolean> {
   const globalPath = globalConfigPath();
-  const projectPath = projectConfigPath(cwd);
+  const workspaceRoot = await findWorkspaceRoot(cwd);
+  const projectPath = projectConfigPath(workspaceRoot);
 
   if (await fileExists(globalPath)) return false;
   if (await fileExists(projectPath)) return false;
@@ -94,7 +118,7 @@ function commandAvailableVia(command: string, cwd: string): 'global' | 'npx' | n
 function resolveServer(
   name: string,
   config: LspServerUserConfig,
-  cwd: string,
+  workspaceRoot: string,
 ): ResolvedServerConfig | null {
   if (config.disabled) return null;
   if (!config.command || config.command.length === 0) return null;
@@ -103,7 +127,7 @@ function resolveServer(
   let finalCommand = config.command[0];
   let finalArgs = config.command.slice(1);
 
-  const via = commandAvailableVia(finalCommand, cwd);
+  const via = commandAvailableVia(finalCommand, workspaceRoot);
   if (!via) return null;
   if (via === 'npx') {
     finalArgs = ['--yes', finalCommand, ...finalArgs];
@@ -123,20 +147,22 @@ function resolveServer(
 // ── Public API ──────────────────────────────────────────────────────────────
 
 export interface LoadedConfig {
+  workspaceRoot: string;
   servers: ResolvedServerConfig[];
   globalDisabled: boolean;
   errors: string[];
 }
 
-export async function loadConfig(cwd: string): Promise<LoadedConfig> {
+export async function loadConfig(workspaceRoot: string): Promise<LoadedConfig> {
+  const resolvedWorkspaceRoot = await findWorkspaceRoot(workspaceRoot);
   const errors: string[] = [];
 
   const globalConfig = await loadJsonFile<LspConfigFile>(globalConfigPath());
-  const projectConfig = await loadJsonFile<LspConfigFile>(projectConfigPath(cwd));
+  const projectConfig = await loadJsonFile<LspConfigFile>(projectConfigPath(resolvedWorkspaceRoot));
 
   // Check if globally disabled
   if (globalConfig?.lsp === false || projectConfig?.lsp === false) {
-    return { servers: [], globalDisabled: true, errors };
+    return { workspaceRoot: resolvedWorkspaceRoot, servers: [], globalDisabled: true, errors };
   }
 
   const globalServers = (typeof globalConfig?.lsp === 'object' ? globalConfig.lsp : {}) as Record<
@@ -162,13 +188,13 @@ export async function loadConfig(cwd: string): Promise<LoadedConfig> {
       userConfig.env = { ...globalServers[name]?.env, ...projectServers[name]?.env };
     }
 
-    const resolved = resolveServer(name, userConfig, cwd);
+    const resolved = resolveServer(name, userConfig, resolvedWorkspaceRoot);
     if (resolved) {
       servers.push(resolved);
     }
   }
 
-  return { servers, globalDisabled: false, errors };
+  return { workspaceRoot: resolvedWorkspaceRoot, servers, globalDisabled: false, errors };
 }
 
 /** Find all servers that handle a given file extension. */

@@ -62,21 +62,35 @@ function validateParams(
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
+export interface WorkspaceFileTarget {
+  inputPath: string;
+  absolutePath: string;
+  workspaceRoot: string;
+  workspaceFilePath: string;
+}
+
 export interface ServerManager {
+  /** Resolve a file path into a workspace-relative target. */
+  resolveFileTarget?: (filePath: string) => Promise<WorkspaceFileTarget>;
   /** Get all LSP clients that handle a given file extension. */
-  clientsForFile: (filePath: string) => LspClient[];
+  clientsForFile: (target: WorkspaceFileTarget) => Promise<LspClient[]>;
   /** Get the first LSP client that handles a file and has a capability. */
-  clientForFileWithCapability: (filePath: string, capability: string) => LspClient | null;
+  clientForFileWithCapability: (
+    target: WorkspaceFileTarget,
+    capability: string,
+  ) => Promise<LspClient | null>;
   /** Get any initialized client (for workspace-wide ops). */
-  anyClient: () => LspClient | null;
-  /** Current root path. */
-  getRootPath: () => string;
+  anyClient: () => Promise<LspClient | null>;
+  /** Current workspace root for status updates. */
+  getWorkspaceRootForStatus?: (filePath?: string) => Promise<string>;
+  /** Backward-compatible single-root fallback. */
+  getRootPath?: () => string;
 }
 
 // ── Capability map ──────────────────────────────────────────────────────────
 
 const CAPABILITY_MAP: Record<LspOperation, string> = {
-  diagnostics: 'textDocumentSync', // all servers with sync support
+  diagnostics: 'textDocumentSync',
   hover: 'hoverProvider',
   goToDefinition: 'definitionProvider',
   findReferences: 'referencesProvider',
@@ -91,6 +105,16 @@ const CAPABILITY_MAP: Record<LspOperation, string> = {
 
 // ── Registration ────────────────────────────────────────────────────────────
 
+function defaultTarget(filePath: string, mgr: ServerManager): WorkspaceFileTarget {
+  const rootPath = mgr.getRootPath?.() ?? '';
+  return {
+    inputPath: filePath,
+    absolutePath: filePath,
+    workspaceRoot: rootPath,
+    workspaceFilePath: filePath,
+  };
+}
+
 export function registerLspTool(pi: ExtensionAPI, mgr: ServerManager) {
   pi.registerTool({
     name: 'lsp',
@@ -104,12 +128,12 @@ export function registerLspTool(pi: ExtensionAPI, mgr: ServerManager) {
       '  hover             — get type info and documentation for a symbol',
       '  diagnostics       — get type errors and lint warnings for a file',
       '  documentSymbol    — get all symbols in a file',
-      '  workspaceSymbol   — search for symbols across the workspace',
+      '  workspaceSymbol   — search symbols across the workspace',
       '  goToImplementation — find implementations of an interface/abstract method',
       '  prepareCallHierarchy — get call hierarchy item at a position',
       '  incomingCalls     — find callers of a function/method',
       '  outgoingCalls     — find callees of a function/method',
-      '  codeActions       — get quick fixes and refactoring suggestions',
+      '  codeActions       — quick fixes and refactoring suggestions',
       '',
       'Parameters:',
       '  operation (required) — one of the operations above',
@@ -139,28 +163,29 @@ export function registerLspTool(pi: ExtensionAPI, mgr: ServerManager) {
       const line = params.line;
       const character = params.character;
       const query = params.query;
-      const rootPath = mgr.getRootPath();
 
-      // Validate required params
       const validationError = validateParams(operation, filePath, line, character, query);
       if (validationError) throw new Error(validationError);
 
-      // ── diagnostics (aggregate from all matching servers) ──
+      const target = filePath
+        ? mgr.resolveFileTarget
+          ? await mgr.resolveFileTarget(filePath)
+          : defaultTarget(filePath, mgr)
+        : null;
+
       if (operation === 'diagnostics') {
-        return executeDiagnostics(mgr, filePath!, rootPath);
+        return executeDiagnostics(mgr, target!);
       }
 
-      // ── workspaceSymbol (doesn't need a file-based server lookup) ──
       if (operation === 'workspaceSymbol') {
-        return executeWorkspaceSymbol(mgr, query!, rootPath);
+        return executeWorkspaceSymbol(mgr, query!);
       }
 
-      // ── all other operations: route to first capable server ──
       const capability = CAPABILITY_MAP[operation];
-      const client = mgr.clientForFileWithCapability(filePath!, capability);
+      const client = await mgr.clientForFileWithCapability(target!, capability);
       if (!client) {
         throw new Error(
-          `No LSP server with '${operation}' capability found for ${filePath}. Check /lsp status.`,
+          `No LSP server with '${operation}' capability found for ${target!.inputPath}. Check /lsp status.`,
         );
       }
 
@@ -168,61 +193,90 @@ export function registerLspTool(pi: ExtensionAPI, mgr: ServerManager) {
 
       switch (operation) {
         case 'hover': {
-          const result = await client.hover(filePath!, pos);
-          return ok(formatHover(result, filePath!, pos.line, pos.character));
+          const result = await client.hover(target!.workspaceFilePath, pos);
+          return ok(formatHover(result, target!.inputPath, pos.line, pos.character));
         }
 
         case 'goToDefinition': {
-          const locs = await client.definition(filePath!, pos);
+          const locs = await client.definition(target!.workspaceFilePath, pos);
           return ok(
-            formatLocations(locs, 'Definition', filePath!, pos.line, pos.character, rootPath),
+            formatLocations(
+              locs,
+              'Definition',
+              target!.inputPath,
+              pos.line,
+              pos.character,
+              target!.workspaceRoot,
+            ),
           );
         }
 
         case 'findReferences': {
-          const locs = await client.references(filePath!, pos);
+          const locs = await client.references(target!.workspaceFilePath, pos);
           return ok(
-            formatLocations(locs, 'References', filePath!, pos.line, pos.character, rootPath),
+            formatLocations(
+              locs,
+              'References',
+              target!.inputPath,
+              pos.line,
+              pos.character,
+              target!.workspaceRoot,
+            ),
           );
         }
 
         case 'goToImplementation': {
-          const locs = await client.implementation(filePath!, pos);
+          const locs = await client.implementation(target!.workspaceFilePath, pos);
           return ok(
-            formatLocations(locs, 'Implementation', filePath!, pos.line, pos.character, rootPath),
+            formatLocations(
+              locs,
+              'Implementation',
+              target!.inputPath,
+              pos.line,
+              pos.character,
+              target!.workspaceRoot,
+            ),
           );
         }
 
         case 'documentSymbol': {
-          const symbols = await client.documentSymbol(filePath!);
-          return ok(formatDocumentSymbols(symbols, filePath!, rootPath));
+          const symbols = await client.documentSymbol(target!.workspaceFilePath);
+          return ok(formatDocumentSymbols(symbols, target!.inputPath, target!.workspaceRoot));
         }
 
         case 'prepareCallHierarchy': {
-          const items = await client.prepareCallHierarchy(filePath!, pos);
-          return ok(formatCallHierarchy(items, filePath!, pos.line, pos.character, rootPath));
+          const items = await client.prepareCallHierarchy(target!.workspaceFilePath, pos);
+          return ok(
+            formatCallHierarchy(
+              items,
+              target!.inputPath,
+              pos.line,
+              pos.character,
+              target!.workspaceRoot,
+            ),
+          );
         }
 
         case 'incomingCalls': {
-          const items = await client.prepareCallHierarchy(filePath!, pos);
+          const items = await client.prepareCallHierarchy(target!.workspaceFilePath, pos);
           if (items.length === 0) {
-            return ok(`No call hierarchy item at ${filePath!}:${line}:${character}`);
+            return ok(`No call hierarchy item at ${target!.inputPath}:${line}:${character}`);
           }
           const calls = await client.incomingCalls(items[0]);
-          return ok(formatIncomingCalls(calls, items[0], rootPath));
+          return ok(formatIncomingCalls(calls, items[0], target!.workspaceRoot));
         }
 
         case 'outgoingCalls': {
-          const items = await client.prepareCallHierarchy(filePath!, pos);
+          const items = await client.prepareCallHierarchy(target!.workspaceFilePath, pos);
           if (items.length === 0) {
-            return ok(`No call hierarchy item at ${filePath!}:${line}:${character}`);
+            return ok(`No call hierarchy item at ${target!.inputPath}:${line}:${character}`);
           }
           const calls = await client.outgoingCalls(items[0]);
-          return ok(formatOutgoingCalls(calls, items[0], rootPath));
+          return ok(formatOutgoingCalls(calls, items[0], target!.workspaceRoot));
         }
 
         case 'codeActions': {
-          const diagsForFile = await client.getDiagnostics(filePath!);
+          const diagsForFile = await client.getDiagnostics(target!.workspaceFilePath);
           const zeroLine = toZeroIndexed(line!);
           const lineDiags = diagsForFile.filter(
             (d) => d.range.start.line <= zeroLine && d.range.end.line >= zeroLine,
@@ -231,8 +285,10 @@ export function registerLspTool(pi: ExtensionAPI, mgr: ServerManager) {
             start: { line: zeroLine, character: 0 },
             end: { line: zeroLine, character: Number.MAX_SAFE_INTEGER },
           };
-          const actions = await client.codeActions(filePath!, range, { diagnostics: lineDiags });
-          return ok(formatCodeActions(actions, filePath!, zeroLine));
+          const actions = await client.codeActions(target!.workspaceFilePath, range, {
+            diagnostics: lineDiags,
+          });
+          return ok(formatCodeActions(actions, target!.inputPath, zeroLine));
         }
 
         default:
@@ -244,15 +300,14 @@ export function registerLspTool(pi: ExtensionAPI, mgr: ServerManager) {
 
 // ── Operation executors ─────────────────────────────────────────────────────
 
-async function executeDiagnostics(mgr: ServerManager, filePath: string, _rootPath: string) {
+async function executeDiagnostics(mgr: ServerManager, target: WorkspaceFileTarget) {
   const groups: { source: string; diagnostics: Diagnostic[] }[] = [];
   const errors: string[] = [];
 
-  // Gather from all LSP servers that handle this file
-  const clients = mgr.clientsForFile(filePath);
+  const clients = await mgr.clientsForFile(target);
   for (const client of clients) {
     try {
-      const diags = await client.getDiagnostics(filePath);
+      const diags = await client.getDiagnostics(target.workspaceFilePath);
       if (diags.length > 0) {
         groups.push({ source: client.config.name, diagnostics: diags });
       }
@@ -261,7 +316,7 @@ async function executeDiagnostics(mgr: ServerManager, filePath: string, _rootPat
     }
   }
 
-  const text = formatDiagnostics(filePath, groups);
+  const text = formatDiagnostics(target.inputPath, groups);
   const errorNote = errors.length > 0 ? `\n\nNote: ${errors.join('; ')}` : '';
 
   return {
@@ -273,12 +328,11 @@ async function executeDiagnostics(mgr: ServerManager, filePath: string, _rootPat
   };
 }
 
-async function executeWorkspaceSymbol(mgr: ServerManager, query: string, rootPath: string) {
-  const client = mgr.anyClient();
+async function executeWorkspaceSymbol(mgr: ServerManager, query: string) {
+  const client = await mgr.anyClient();
   if (!client) throw new Error('No LSP server available for workspace symbol search.');
 
-  const symbols = await client.workspaceSymbol(query);
-  return ok(formatWorkspaceSymbols(symbols, query, rootPath));
+  return ok(formatWorkspaceSymbols(await client.workspaceSymbol(query), query, client.workspaceRoot));
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

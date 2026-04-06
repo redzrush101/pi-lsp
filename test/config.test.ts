@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { loadConfig, scaffoldGlobalConfig } from '../extensions/lsp/config';
+import { findWorkspaceRoot, loadConfig, scaffoldGlobalConfig } from '../extensions/lsp/config';
 
 let originalHome = process.env.HOME;
 const cleanup: string[] = [];
@@ -106,6 +106,16 @@ describe('config loader', () => {
     expect(rust?.extensions).toEqual(['.rs', '.ron']);
     expect(rust?.env).toEqual({ RUST_LOG: 'debug', A: '1', B: '2' });
     expect(rust?.initializationOptions).toEqual({ cargo: { allFeatures: true } });
+  });
+
+  test('finds the nearest workspace root for nested files', async () => {
+    const workspace = await makeTempDir('pi-lsp-workspace-');
+    const nested = join(workspace, 'packages', 'feature', 'src');
+    await mkdir(nested, { recursive: true });
+    await writeFile(join(workspace, 'package.json'), '{"name":"workspace"}', 'utf8');
+
+    const root = await findWorkspaceRoot(nested);
+    expect(root).toBe(workspace);
   });
 
   test('lsp false disables everything', async () => {

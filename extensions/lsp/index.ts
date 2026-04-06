@@ -10,25 +10,59 @@
  */
 
 import type { ExtensionAPI } from '@mariozechner/pi-coding-agent';
+import { dirname, relative, resolve } from 'node:path';
 
 import { LspClient } from './client';
-import { loadConfig, scaffoldGlobalConfig, serversForExtension, type LoadedConfig } from './config';
-import { registerLspTool, type ServerManager } from './tools';
+import { findWorkspaceRoot, loadConfig, scaffoldGlobalConfig, serversForExtension, type LoadedConfig } from './config';
+import { registerLspTool, type ServerManager, type WorkspaceFileTarget } from './tools';
 import type { ResolvedServerConfig } from './types';
 
+interface WorkspaceContext {
+  rootPath: string;
+  config: LoadedConfig;
+}
+
 export default function lspExtension(pi: ExtensionAPI) {
-  let rootPath = '';
-  let config: LoadedConfig | null = null;
+  let sessionRoot = '';
+  const configs = new Map<string, LoadedConfig>();
   const clients = new Map<string, LspClient>();
 
-  // ── Client management ───────────────────────────────────────────────
+  // ── Helpers ───────────────────────────────────────────────────────────
 
-  function getOrCreateClient(serverConfig: ResolvedServerConfig): LspClient {
-    const existing = clients.get(serverConfig.name);
+  function clientKey(workspaceRoot: string, serverName: string): string {
+    return `${workspaceRoot}::${serverName}`;
+  }
+
+  async function getWorkspaceContext(workspaceRoot: string): Promise<WorkspaceContext> {
+    const resolvedRoot = await findWorkspaceRoot(workspaceRoot);
+    let config = configs.get(resolvedRoot);
+    if (!config) {
+      config = await loadConfig(resolvedRoot);
+      configs.set(resolvedRoot, config);
+    }
+    return { rootPath: resolvedRoot, config };
+  }
+
+  async function resolveFileTarget(filePath: string): Promise<WorkspaceFileTarget> {
+    const absolutePath = filePath.startsWith('/') ? filePath : resolve(sessionRoot, filePath);
+    const workspaceRoot = await findWorkspaceRoot(dirname(absolutePath));
+    const relativePath = relative(workspaceRoot, absolutePath);
+
+    return {
+      inputPath: filePath,
+      absolutePath,
+      workspaceRoot,
+      workspaceFilePath: relativePath,
+    };
+  }
+
+  function getOrCreateClient(serverConfig: ResolvedServerConfig, workspaceRoot: string): LspClient {
+    const key = clientKey(workspaceRoot, serverConfig.name);
+    const existing = clients.get(key);
     if (existing) return existing;
 
-    const client = new LspClient(serverConfig, rootPath);
-    clients.set(serverConfig.name, client);
+    const client = new LspClient(serverConfig, workspaceRoot);
+    clients.set(key, client);
     return client;
   }
 
@@ -36,11 +70,13 @@ export default function lspExtension(pi: ExtensionAPI) {
     const shutdowns = [...clients.values()].map((c) => c.shutdown().catch(() => {}));
     await Promise.all(shutdowns);
     clients.clear();
+    configs.clear();
   }
 
   function refreshStatus(
     ui: { setStatus: (key: string, value: string) => void },
     cfg: LoadedConfig | null,
+    workspaceRoot?: string,
   ) {
     if (!cfg) {
       ui.setStatus('lsp', 'LSP: no servers detected');
@@ -57,7 +93,10 @@ export default function lspExtension(pi: ExtensionAPI) {
       return;
     }
 
-    const running = cfg.servers.filter((server) => clients.get(server.name)?.isInitialized);
+    const root = workspaceRoot ?? cfg.workspaceRoot;
+    const running = cfg.servers.filter((server) =>
+      clients.get(clientKey(root, server.name))?.isInitialized,
+    );
     if (running.length > 0) {
       ui.setStatus('lsp', `LSP: ${running.map((s) => s.name).join(', ')} (running)`);
       return;
@@ -69,37 +108,49 @@ export default function lspExtension(pi: ExtensionAPI) {
   // ── Server manager (passed to tool) ───────────────────────────────────
 
   const serverManager: ServerManager = {
-    clientsForFile(filePath: string): LspClient[] {
-      if (!config) return [];
-      const matching = serversForExtension(config.servers, filePath);
-      return matching.map((s) => getOrCreateClient(s));
+    async resolveFileTarget(filePath: string): Promise<WorkspaceFileTarget> {
+      return resolveFileTarget(filePath);
     },
 
-    clientForFileWithCapability(filePath: string, capability: string): LspClient | null {
-      if (!config) return null;
-      const matching = serversForExtension(config.servers, filePath);
+    async clientsForFile(target: WorkspaceFileTarget): Promise<LspClient[]> {
+      const ctx = await getWorkspaceContext(target.workspaceRoot);
+      const matching = serversForExtension(ctx.config.servers, target.workspaceFilePath);
+      return matching.map((s) => getOrCreateClient(s, ctx.rootPath));
+    },
+
+    async clientForFileWithCapability(
+      target: WorkspaceFileTarget,
+      capability: string,
+    ): Promise<LspClient | null> {
+      const ctx = await getWorkspaceContext(target.workspaceRoot);
+      const matching = serversForExtension(ctx.config.servers, target.workspaceFilePath);
       for (const serverConfig of matching) {
-        const client = getOrCreateClient(serverConfig);
-        // If not yet initialized, return it (capability check happens after init)
+        const client = getOrCreateClient(serverConfig, ctx.rootPath);
         if (!client.isInitialized) return client;
         if (client.hasCapability(capability)) return client;
       }
       return null;
     },
 
-    anyClient(): LspClient | null {
-      // Return first initialized client, or first available
+    async anyClient(): Promise<LspClient | null> {
       for (const client of clients.values()) {
         if (client.isInitialized) return client;
       }
-      // Try to create one from config
-      if (config && config.servers.length > 0) {
-        return getOrCreateClient(config.servers[0]);
+
+      const ctx = await getWorkspaceContext(sessionRoot);
+      if (ctx.config.servers.length > 0) {
+        return getOrCreateClient(ctx.config.servers[0], ctx.rootPath);
       }
       return null;
     },
 
-    getRootPath: () => rootPath,
+    async getWorkspaceRootForStatus(filePath?: string): Promise<string> {
+      if (filePath) {
+        const target = await resolveFileTarget(filePath);
+        return target.workspaceRoot;
+      }
+      return findWorkspaceRoot(sessionRoot);
+    },
   };
 
   // ── Register tool ─────────────────────────────────────────────────────
@@ -109,9 +160,9 @@ export default function lspExtension(pi: ExtensionAPI) {
   // ── Session lifecycle ─────────────────────────────────────────────────
 
   pi.on('session_start', async (_event, ctx) => {
-    rootPath = ctx.cwd;
+    sessionRoot = ctx.cwd;
 
-    const scaffolded = await scaffoldGlobalConfig(rootPath);
+    const scaffolded = await scaffoldGlobalConfig(sessionRoot);
     if (scaffolded) {
       ctx.ui.notify(
         'LSP: created starter config at ~/.pi/agent/extensions/lsp/config.json — edit it to add your servers.',
@@ -119,18 +170,20 @@ export default function lspExtension(pi: ExtensionAPI) {
       );
     }
 
-    config = await loadConfig(rootPath);
-    refreshStatus(ctx.ui, config);
+    const initialConfig = await loadConfig(sessionRoot);
+    configs.set(initialConfig.workspaceRoot, initialConfig);
+    refreshStatus(ctx.ui, initialConfig, initialConfig.workspaceRoot);
   });
 
   pi.on('session_shutdown', async () => {
     await shutdownAll();
-    config = null;
   });
 
   pi.on('tool_execution_end', async (event, ctx) => {
     if (event.toolName !== 'lsp') return;
-    refreshStatus(ctx.ui, config);
+    const cfg = await loadConfig(sessionRoot);
+    configs.set(cfg.workspaceRoot, cfg);
+    refreshStatus(ctx.ui, cfg, cfg.workspaceRoot);
   });
 
   // ── Commands ──────────────────────────────────────────────────────────
@@ -138,11 +191,11 @@ export default function lspExtension(pi: ExtensionAPI) {
   pi.registerCommand('lsp', {
     description: 'Show LSP server status',
     handler: async (_args, ctx) => {
-      rootPath = ctx.cwd;
-      const cfg = await loadConfig(ctx.cwd);
-      config = cfg;
-      refreshStatus(ctx.ui, cfg);
-      const lines: string[] = ['LSP Status:'];
+      sessionRoot = ctx.cwd;
+      const cfg = await loadConfig(sessionRoot);
+      configs.set(cfg.workspaceRoot, cfg);
+      refreshStatus(ctx.ui, cfg, cfg.workspaceRoot);
+      const lines: string[] = ['LSP Status:', `  Workspace: ${cfg.workspaceRoot}`];
 
       if (cfg.globalDisabled) {
         lines.push('  All servers disabled via config.');
@@ -151,7 +204,7 @@ export default function lspExtension(pi: ExtensionAPI) {
         lines.push('  Add servers to ~/.pi/agent/extensions/lsp/config.json or .pi/lsp.json');
       } else {
         for (const server of cfg.servers) {
-          const client = clients.get(server.name);
+          const client = clients.get(clientKey(cfg.workspaceRoot, server.name));
           const status = client?.isInitialized ? 'running' : 'available (lazy start)';
           const exts = server.extensions.join(', ');
           lines.push(`  ${server.name}: ${status} — handles ${exts}`);
@@ -171,10 +224,10 @@ export default function lspExtension(pi: ExtensionAPI) {
     description: 'Restart all LSP servers',
     handler: async (_args, ctx) => {
       await shutdownAll();
-      config = null;
-      rootPath = ctx.cwd;
-      config = await loadConfig(ctx.cwd);
-      refreshStatus(ctx.ui, config);
+      sessionRoot = ctx.cwd;
+      const cfg = await loadConfig(sessionRoot);
+      configs.set(cfg.workspaceRoot, cfg);
+      refreshStatus(ctx.ui, cfg, cfg.workspaceRoot);
       ctx.ui.notify('LSP servers stopped. Will reinitialize on next tool use.', 'info');
     },
   });

@@ -232,6 +232,10 @@ export class LspClient {
     return this.serverCapabilities;
   }
 
+  get workspaceRoot(): string {
+    return this.rootPath;
+  }
+
   /** Check if the server advertised a specific capability. */
   hasCapability(name: string): boolean {
     return this.serverCapabilities[name] !== undefined && this.serverCapabilities[name] !== false;

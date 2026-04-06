@@ -185,4 +185,60 @@ describe('extension/session layer', () => {
 
     await sessionShutdown?.({}, ctx);
   });
+
+  test('routes file-based tool calls into a nested workspace when session cwd is outside it', async () => {
+    const home = await makeTempDir('pi-lsp-home-');
+    const outerCwd = await makeTempDir('pi-lsp-outer-');
+    const workspace = join(outerCwd, 'nested-workspace');
+    process.env.HOME = home;
+
+    await mkdir(join(outerCwd, '.pi'), { recursive: true });
+    await writeFile(join(outerCwd, '.pi', 'lsp.json'), '{"lsp":{}}', 'utf8');
+    await mkdir(join(workspace, '.pi'), { recursive: true });
+    await mkdir(join(workspace, 'src'), { recursive: true });
+    await writeFile(join(workspace, 'package.json'), '{"name":"nested-workspace"}', 'utf8');
+    await writeFile(join(workspace, 'src', 'mock.ts'), 'const value = 1;\n', 'utf8');
+
+    const mockServerPath = fileURLToPath(new URL('./mock-lsp-server.ts', import.meta.url));
+    await writeFile(
+      join(workspace, '.pi', 'lsp.json'),
+      JSON.stringify(
+        {
+          lsp: {
+            mock: {
+              command: ['bun', mockServerPath],
+              extensions: ['.ts'],
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    );
+
+    const pi = createFakePi();
+    lspExtension(pi as any);
+
+    const ui = createUiRecorder();
+    const ctx = { cwd: outerCwd, ui: ui.ui };
+
+    const sessionStart = pi.handlers.get('session_start')?.[0];
+    expect(sessionStart).toBeTruthy();
+    expect(pi.tool).toBeTruthy();
+
+    await sessionStart?.({}, ctx);
+    expect(ui.statuses.get('lsp')).toBe('LSP: no servers detected');
+
+    const toolResult = await pi.tool.execute(
+      'tool-nested',
+      { operation: 'hover', filePath: 'nested-workspace/src/mock.ts', line: 1, character: 1 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect((toolResult.content[0] as { text?: string } | undefined)?.text).toContain(
+      'Mock hover docs',
+    );
+  });
 });
