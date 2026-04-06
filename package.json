@@ -9,8 +9,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/dreki-gg/pi-extensions",
-    "directory": "packages/lsp"
+    "url": "https://github.com/redzrush101/pi-lsp.git"
   },
   "type": "module",
   "scripts": {
